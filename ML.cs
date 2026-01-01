@@ -14,10 +14,13 @@ internal class Program
     private static readonly string SentimentPath = Path.Combine(DataDir, "sentiment.csv");
     private static readonly string IrisPath = Path.Combine(DataDir, "iris.csv");
     private static readonly string HousePath = Path.Combine(DataDir, "house.csv");
+    private static readonly string EmailSpamPath = Path.Combine(DataDir, "email_spam.csv");
+
 
     private static readonly string SentimentModelPath = Path.Combine(ModelsDir, "sentiment.zip");
     private static readonly string IrisModelPath = Path.Combine(ModelsDir, "iris.zip");
     private static readonly string HouseModelPath = Path.Combine(ModelsDir, "house.zip");
+    private static readonly string EmailSpamModelPath = Path.Combine(ModelsDir, "email_spam.zip");
 
     static void Main()
     {
@@ -28,21 +31,21 @@ internal class Program
         while (true)
         {
             Console.WriteLine("\n==== ML.NET Demo ====");
-            Console.WriteLine("1) Sentiment Analysis (Binary)");
-            Console.WriteLine("2) Iris Species (Multiclass)");
-            Console.WriteLine("3) Hauspreis (Regression)");
-            Console.WriteLine("4) Modelle laden und testen");
-            Console.WriteLine("0) Beenden");
+            Console.WriteLine("0) Modelle laden und testen");
+            Console.WriteLine("1) Iris Species (Multiclass)");
+            Console.WriteLine("2) Hauspreis (Regression)");
+            Console.WriteLine("3) Sentiment Analysis (Binary)");
+            Console.WriteLine("4) Email Spam (Binary: Text + Attachment + Zahlenfeatures)");
             Console.Write("Auswahl: ");
             var input = Console.ReadLine()?.Trim();
 
             switch (input)
             {
-                case "1": TrainSentiment(ml); break;
-                case "2": TrainIris(ml); break;
-                case "3": TrainHouse(ml); break;
-                case "4": LoadAndPredict(ml); break;
-                case "0": return;
+                case "0": LoadAndPredict(ml); break;
+                case "1": TrainIris(ml); break;
+                case "2": TrainHouse(ml); break;
+                case "3": TrainSentiment(ml); break; 
+                case "4": TrainEmailSpam(ml); break;
                 default: Console.WriteLine("Ungültige Auswahl."); break;
             }
         }
@@ -56,7 +59,9 @@ internal class Program
 
         Console.WriteLine("== Sentiment Analysis ==");
 
-        var data = ml.Data.LoadFromTextFile<SentimentData>(SentimentPath, hasHeader: true, separatorChar: ',');
+        //var data = ml.Data.LoadFromTextFile<SentimentData>(SentimentPath, hasHeader: true, separatorChar: ',');
+        var data = ml.Data.LoadFromTextFile<SentimentData>(SentimentPath, hasHeader: true, separatorChar: ',', allowQuoting: true);
+
         var split = ml.Data.TrainTestSplit(data, testFraction: 0.25);
         var pipeline = ml.Transforms.Text.FeaturizeText("Features", nameof(SentimentData.Text)).Append(ml.BinaryClassification.Trainers.SdcaLogisticRegression( labelColumnName: nameof(SentimentData.Label),  featureColumnName: "Features"));
         var model = pipeline.Fit(split.TrainSet);
@@ -246,6 +251,195 @@ internal class Program
     }
 
     // ------------------------------------------------------
+    // 5) Email Spam
+    // ------------------------------------------------------
+    private static void TrainEmailSpam1(MLContext ml)
+    {
+        Console.WriteLine("== Email Spam (Binary: Text + Attachment + Numbers) ==");
+
+        //var data = ml.Data.LoadFromTextFile<EmailSpamData>(EmailSpamPath, hasHeader: true, separatorChar: ',');
+        var data = ml.Data.LoadFromTextFile<EmailSpamData>(EmailSpamPath,hasHeader: true,separatorChar: ',',allowQuoting: true);
+
+        var split = ml.Data.TrainTestSplit(data, testFraction: 0.25);
+
+        // Text (Subject+Body) -> TextFeatures
+        // Bool + Zahlen -> Features dazu
+        var pipeline =
+            ml.Transforms.Concatenate("TextAll", nameof(EmailSpamData.Subject), nameof(EmailSpamData.Body))
+              .Append(ml.Transforms.Text.FeaturizeText("TextFeatures", "TextAll"))
+
+              // Bool -> float
+              .Append(ml.Transforms.Conversion.ConvertType("HasAttachmentF", nameof(EmailSpamData.HasAttachment), DataKind.Single))
+
+              // Alles zusammen
+              .Append(ml.Transforms.Concatenate("Features",
+                  "TextFeatures",
+                  "HasAttachmentF",
+                  nameof(EmailSpamData.AttachmentCount),
+                  nameof(EmailSpamData.NumLinks),
+                  nameof(EmailSpamData.BodyLength)))
+
+              // Trainer: limit Iterations, damit es nicht "ewig" läuft
+              .Append(ml.BinaryClassification.Trainers.SdcaLogisticRegression(
+                  labelColumnName: nameof(EmailSpamData.IsSpam),
+                  featureColumnName: "Features",
+                  maximumNumberOfIterations: 50));
+
+        var sw = System.Diagnostics.Stopwatch.StartNew();
+        Console.WriteLine("Training läuft...");
+        var model = pipeline.Fit(split.TrainSet);
+        sw.Stop();
+        Console.WriteLine($"Training fertig nach {sw.Elapsed}.");
+
+        var pred = model.Transform(split.TestSet);
+        var metrics = ml.BinaryClassification.Evaluate(pred, labelColumnName: nameof(EmailSpamData.IsSpam));
+
+        Console.WriteLine($"Accuracy: {metrics.Accuracy:P2}");
+        Console.WriteLine($"AUC:      {metrics.AreaUnderRocCurve:0.###}");
+        Console.WriteLine($"F1:       {metrics.F1Score:0.###}");
+
+        ml.Model.Save(model, split.TrainSet.Schema, EmailSpamModelPath);
+        Console.WriteLine($"Gespeichert: {EmailSpamModelPath}");
+
+        var engine = ml.Model.CreatePredictionEngine<EmailSpamData, EmailSpamPrediction>(model);
+
+        // 2 schnelle Beispiele:
+        var spam = new EmailSpamData
+        {
+            Subject = "Limited offer: 90% off",
+            Body = "Buy now and save 90%. Only today: http://sale.example",
+            HasAttachment = false,
+            AttachmentCount = 0,
+            NumLinks = 1,
+            BodyLength = 62
+        };
+        var ham = new EmailSpamData
+        {
+            Subject = "Invoice for December",
+            Body = "Hello, please find the invoice for December. Let me know if you have questions.",
+            HasAttachment = true,
+            AttachmentCount = 1,
+            NumLinks = 0,
+            BodyLength = 90
+        };
+
+        var ps = engine.Predict(spam);
+        var ph = engine.Predict(ham);
+
+        Console.WriteLine($"Sample SPAM? {(ps.PredictedLabel ? "SPAM" : "HAM")} (Prob={ps.Probability:0.###})");
+        Console.WriteLine($"Sample HAM?  {(ph.PredictedLabel ? "SPAM" : "HAM")} (Prob={ph.Probability:0.###})");
+    }
+
+    private static void TrainEmailSpam(MLContext ml)
+    {
+        Console.WriteLine("== Email Spam (Binary: Text + Attachment + Numbers) ==");
+
+        var data = ml.Data.LoadFromTextFile<EmailSpamData>(
+            EmailSpamPath,
+            hasHeader: true,
+            separatorChar: ',',
+            allowQuoting: true);
+
+        // Sanity-Check: erste 3 Zeilen anzeigen (damit du Parsing siehst)
+        foreach (var r in ml.Data.CreateEnumerable<EmailSpamData>(data, reuseRowObject: false).Take(3))
+            Console.WriteLine($"Row: IsSpam={r.IsSpam}, HasAtt={r.HasAttachment}, Links={r.NumLinks}, Subj={r.Subject}");
+
+        var split = ml.Data.TrainTestSplit(data, testFraction: 0.25, seed: 1);
+
+        var pipeline =
+            // Text -> Features (Subject + Body getrennt!)
+            ml.Transforms.Text.FeaturizeText("SubjectFeats", nameof(EmailSpamData.Subject))
+              .Append(ml.Transforms.Text.FeaturizeText("BodyFeats", nameof(EmailSpamData.Body)))
+
+              // Bool -> float
+              .Append(ml.Transforms.Conversion.ConvertType(
+                  outputColumnName: "HasAttachmentF",
+                  inputColumnName: nameof(EmailSpamData.HasAttachment),
+                  outputKind: DataKind.Single))
+
+              // Optional: Zahlen normalisieren (hilft oft)
+              .Append(ml.Transforms.NormalizeMeanVariance(nameof(EmailSpamData.AttachmentCount)))
+              .Append(ml.Transforms.NormalizeMeanVariance(nameof(EmailSpamData.NumLinks)))
+              .Append(ml.Transforms.NormalizeMeanVariance(nameof(EmailSpamData.BodyLength)))
+
+              // Alles zu Features
+              .Append(ml.Transforms.Concatenate("Features",
+                  "SubjectFeats",
+                  "BodyFeats",
+                  "HasAttachmentF",
+                  nameof(EmailSpamData.AttachmentCount),
+                  nameof(EmailSpamData.NumLinks),
+                  nameof(EmailSpamData.BodyLength)))
+
+              // Trainer (ich nehme hier LBFGS: stabil für Text + kleine Daten)
+              .Append(ml.BinaryClassification.Trainers.LbfgsLogisticRegression(
+                  labelColumnName: nameof(EmailSpamData.IsSpam),
+                  featureColumnName: "Features"));
+
+        var sw = System.Diagnostics.Stopwatch.StartNew();
+        Console.WriteLine("Training läuft...");
+        var model = pipeline.Fit(split.TrainSet);
+        sw.Stop();
+        Console.WriteLine($"Training fertig nach {sw.Elapsed}.");
+
+        var pred = model.Transform(split.TestSet);
+        var metrics = ml.BinaryClassification.Evaluate(pred, labelColumnName: nameof(EmailSpamData.IsSpam));
+        Console.WriteLine($"Accuracy: {metrics.Accuracy:P2}");
+        Console.WriteLine($"AUC:      {metrics.AreaUnderRocCurve:0.###}");
+        Console.WriteLine($"F1:       {metrics.F1Score:0.###}");
+
+        ml.Model.Save(model, split.TrainSet.Schema, EmailSpamModelPath);
+        Console.WriteLine($"Gespeichert: {EmailSpamModelPath}");
+
+        var engine = ml.Model.CreatePredictionEngine<EmailSpamData, EmailSpamPrediction>(model);
+
+        var spam = new EmailSpamData
+        {
+            Subject = "Limited offer: 90% off",
+            Body = "Buy now and save 90%. Only today: http://sale.example",
+            HasAttachment = false,
+            AttachmentCount = 0,
+            NumLinks = 1,
+            BodyLength = 62
+        };
+        var ham = new EmailSpamData
+        {
+            Subject = "Invoice for December",
+            Body = "Hello, please find the invoice for December. Let me know if you have questions.",
+            HasAttachment = true,
+            AttachmentCount = 1,
+            NumLinks = 0,
+            BodyLength = 90
+        };
+
+        var ps = engine.Predict(spam);
+        var ph = engine.Predict(ham);
+
+        Console.WriteLine($"Sample SPAM? {(ps.PredictedLabel ? "SPAM" : "HAM")} (Prob={ps.Probability:0.###}) Score={ps.Score:0.###}");
+        Console.WriteLine($"Sample HAM?  {(ph.PredictedLabel ? "SPAM" : "HAM")} (Prob={ph.Probability:0.###}) Score={ph.Score:0.###}");
+    }
+
+    public class EmailSpamData
+    {
+        [LoadColumn(0)] public bool IsSpam { get; set; }                 // Label
+        [LoadColumn(1)] public string Subject { get; set; } = "";
+        [LoadColumn(2)] public string Body { get; set; } = "";
+        [LoadColumn(3)] public bool HasAttachment { get; set; }
+
+        [LoadColumn(4)] public float AttachmentCount { get; set; }
+        [LoadColumn(5)] public float NumLinks { get; set; }
+        [LoadColumn(6)] public float BodyLength { get; set; }
+    }
+
+    public class EmailSpamPrediction
+    {
+        [ColumnName("PredictedLabel")] public bool PredictedLabel { get; set; }
+        public float Probability { get; set; }
+        public float Score { get; set; }
+    }
+
+
+    // ------------------------------------------------------
     // 4) Modelle laden und testen
     // ------------------------------------------------------
     private static void LoadAndPredict(MLContext ml)
@@ -256,7 +450,7 @@ internal class Program
         {
             var model = ml.Model.Load(SentimentModelPath, out _);
             var engine = ml.Model.CreatePredictionEngine<SentimentData, SentimentPrediction>(model);
-            var p = engine.Predict(new SentimentData { Text = "I dont know maybe another time." });
+            var p = engine.Predict(new SentimentData { Text = "I dont know maybe another time, its not good." });
             Console.WriteLine($"Sentiment: {(p.PredictedLabel ? "Positiv" : "Negativ")}");
         }
 
@@ -274,6 +468,25 @@ internal class Program
             var engine = ml.Model.CreatePredictionEngine<HouseData, HousePrediction>(model);
             var p = engine.Predict(new HouseData { SizeM2 = 120, Bedrooms = 4, AgeYears = 5 });
             Console.WriteLine($"Hauspreis: {p.Score:0} EUR");
+        }
+
+        if (File.Exists(EmailSpamModelPath))
+        {
+            var model = ml.Model.Load(EmailSpamModelPath, out _);
+            var engine = ml.Model.CreatePredictionEngine<EmailSpamData, EmailSpamPrediction>(model);
+
+            var sample = new EmailSpamData
+            {
+                Subject = "URGENT: Account suspended",
+                Body = "Verify now to avoid closure because money buy: http://bit.ly/verify-now",
+                HasAttachment = false,
+                AttachmentCount = 0,
+                NumLinks = 1,
+                BodyLength = 68
+            };
+
+            var p = engine.Predict(sample);
+            Console.WriteLine($"EmailSpam: {(p.PredictedLabel ? "SPAM" : "HAM")} (Prob={p.Probability:0.###})");
         }
     }
 
